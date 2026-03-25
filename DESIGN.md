@@ -151,6 +151,59 @@ When you start a phase: open this doc, fill in the section, then write the code.
 
 ---
 
+## Phase 2 — loop.go
+
+### EventLoop fields
+
+```go
+type EventLoop struct {
+    p           *poller          // OS poller (kqueue on darwin, epoll on linux)
+    stopped     atomic.Bool      // set by Stop(); read at the top of every tick
+    timers      timerHeap        // min-heap ordered by deadline
+    timerMap    map[TimerID]*timerEntry  // parallel index for O(1) ClearTimer
+    nextID      atomic.Uint64    // monotonically increasing timer ID source
+    completions chan completion   // work results sent here by QueueWork goroutines
+}
+```
+
+**Why each field exists:**
+
+- `p` — the loop must block on OS I/O readiness. All fd registration and polling goes through the poller so loop.go stays OS-agnostic.
+- `stopped` — `Stop()` is documented as safe to call from any goroutine, so the flag must be atomic. A plain `bool` would be a data race.
+- `timers` + `timerMap` — a min-heap gives O(log n) insert/pop and O(1) peek at the nearest deadline; the parallel map gives O(1) cancel. Without the map, `ClearTimer` would require an O(n) heap scan. Cancelled entries are skipped lazily at pop time rather than removed eagerly — safe because the heap's ordering property is preserved.
+- `nextID` — timer IDs are handed to callers and may be cancelled from any goroutine, so the counter must be atomic.
+- `completions` — `QueueWork` launches a goroutine for each job. The goroutine can't call user callbacks directly (they must run on the loop goroutine), so it sends results to this channel. The loop drains it in phase 3. Buffered at 512 so goroutines rarely block.
+
+### Three-phase tick
+
+```
+POLL → TIMERS → WORK COMPLETIONS
+```
+
+**Why poll first?**
+
+The loop blocks in `p.wait(timeoutMs)` during POLL. The timeout is set to the time remaining until the nearest pending timer, so the loop never oversleeps past a deadline. When the OS wakes the loop early (fd ready), we still run the TIMERS phase immediately after — any timers that expired during the poll are serviced in the same tick.
+
+Polling first (not last) matches libuv. The rationale: I/O events arrive from the outside world and have no "due time"; they should be processed as soon as the OS reports them. Timers are internal; they are checked after the blocking phase ends.
+
+**Why drain completions non-blocking?**
+
+Phase 3 uses a `select { case c := <-completions: … default: break }` loop. If it blocked, a steady stream of QueueWork completions could starve the next POLL phase and delay I/O callbacks indefinitely. Non-blocking drain means: handle everything that arrived this tick, then go back to sleep.
+
+### Stop / wakeup contract
+
+`Stop()` does two things atomically in sequence:
+1. `stopped.Store(true)` — ensures the loop sees the flag on the next iteration even if it wakes for another reason.
+2. `p.trigger()` — writes one byte to the wakeup pipe so a sleeping `p.wait()` returns immediately.
+
+This means Stop() returns quickly regardless of how long the current poll timeout is. The loop checks `stopped` immediately after `p.wait()` returns and exits before firing any callbacks.
+
+### QueueWork wakes the poller
+
+After sending to `completions`, each QueueWork goroutine calls `p.trigger()`. Without this, a completed job would wait until the next poll timeout expired before its `done` callback ran — up to the nearest timer deadline, or forever if no timers are set.
+
+---
+
 ## Implementation order and test gates
 
 | Order | File | Test gate before moving on |
