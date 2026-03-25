@@ -1,6 +1,7 @@
 package goloop
 
 import (
+	"math/rand"
 	"runtime"
 	"sync/atomic"
 	"testing"
@@ -129,6 +130,38 @@ func TestLoopSetInterval(t *testing.T) {
 	l.Stop()
 	if err := <-done; err != nil {
 		t.Fatalf("Run() error: %v", err)
+	}
+}
+
+// TestLoopTimerOrder verifies that 1000 timeouts fire in deadline order.
+func TestLoopTimerOrder(t *testing.T) {
+	l := New()
+
+	const N = 1000
+	r := rand.New(rand.NewSource(42))
+	delays := make([]time.Duration, N)
+	for i := range delays {
+		delays[i] = time.Duration(r.Intn(100)) * time.Millisecond
+	}
+
+	fired := make([]time.Duration, 0, N)
+
+	for _, d := range delays {
+		l.SetTimeout(d, func() { fired = append(fired, d) })
+	}
+
+	l.SetTimeout(150*time.Millisecond, func() { l.Stop() })
+
+	l.Run()
+
+	if len(fired) != N {
+		t.Fatalf("expected %d timers fired, got %d", N, len(fired))
+	}
+
+	for i := 1; i < len(fired); i++ {
+		if fired[i] < fired[i-1] {
+			t.Fatalf("out of order at index %d: %v after %v", i, fired[i], fired[i-1])
+		}
 	}
 }
 
